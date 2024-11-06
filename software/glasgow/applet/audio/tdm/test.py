@@ -24,11 +24,14 @@ class TDMAppletTestCase(GlasgowAppletTestCase, applet=TDMApplet):
         mux_iface = self.applet.mux_interface
         tdm_iface = await self.run_simulated_applet()
 
-        test_data = [0xFF, 0x00, 0x01, 0x02] * 2
-        print(test_data)
+        test_data = b"\xFF\x00\x01\x02" * 2
+
         await tdm_iface.write(test_data)
-        print(await tdm_iface.read(len(test_data))) # TODO why is there some extra byte in front? I don't see that being written
+        result = await tdm_iface.read(len(test_data))
+        self.assertEqual(result, test_data)
+
         await tdm_iface.write(test_data)
-        print(await tdm_iface.read(len(test_data)))
+        result = await tdm_iface.read(len(test_data))
+        self.assertEqual(result, test_data)
 
         # TODO test buffer underflow

@@ -65,13 +65,13 @@ class TDMSubtarget(Elaboratable):
         with m.If(o_fifo.w_rdy & self.out_fifo.r_rdy):
             m.d.comb += o_fifo.w_en.eq(1)
             m.d.comb += self.out_fifo.r_en.eq(1)
-            m.d.sync += o_fifo.w_data.eq(self.out_fifo.r_data)
+            m.d.sync += o_fifo.w_data.eq(self.out_fifo.r_data) # TODO why is this one sync, but in the other direction comb? Works, but suspicious
 
         # Empty i_fifo into self.in_fifo
         with m.If(i_fifo.r_rdy & self.in_fifo.w_rdy):
             m.d.comb += i_fifo.r_en.eq(1)
             m.d.comb += self.in_fifo.w_en.eq(1)
-            m.d.sync += self.in_fifo.w_data.eq(i_fifo.r_data)
+            m.d.comb += self.in_fifo.w_data.eq(i_fifo.r_data)
 
         full_frame_in_fifo = Signal()
         m.d.comb += full_frame_in_fifo.eq(m.submodules.o_fifo.r_level >= bytes_per_frame - 1) # -1 because we keep 1 byte in the fifo out register, I think. Maybe we have to actually check if a byte is present there
@@ -97,13 +97,15 @@ class TDMSubtarget(Elaboratable):
         shreg_i = Signal(8)
         m.d.comb += tx_buffer.o.eq(shreg_o[-1] & active_frame_imm)
         
+
+        # Shift data out of shreg_o and into shreg_i on every bclk
         with m.If(active_frame_imm):
-            # Shift data in / out on every bclk
             m.d.bclk += shreg_o.eq(Cat(C(0, 1), shreg_o))
             m.d.bclk += shreg_i.eq(Cat(rx_buffer.i, shreg_i))
             m.d.bclk += bits_valid_o.eq(bits_valid_o - 1)
             m.d.bclk += bits_valid_i.eq(bits_valid_i + 1)
         
+        # Send out received byte
         with m.If(bits_valid_i >= 8):
             m.d.bclk += i_fifo.w_data.eq(shreg_i)
             m.d.bclk += i_fifo.w_en.eq(1)
@@ -114,7 +116,11 @@ class TDMSubtarget(Elaboratable):
         with m.Else():
             m.d.bclk += i_fifo.w_en.eq(0)
         
-        with m.FSM(domain="bclk"):
+        # Get new transmit byte
+        #TODO did I misunderstand fifo docs here? r_rdy means that data is already in r_data and r_en will put in the next one
+        # maybe this mistake and the comb sync thing above cancel each other?
+        # maybe this can be simplified by fixing both
+        with m.FSM(name="shreg_o_refill", domain="bclk"):
             with m.State("Wait"):
                 # Read a byte from the fifo as soon as it is available, it will be kept in r_data until we need it
                 with m.If(o_fifo.r_rdy):
@@ -167,6 +173,7 @@ class TDMApplet(GlasgowApplet):
         assert args.bit_depth % 8 == 0
         bclk_frequency = args.sample_rate * args.channels * args.bit_depth
         bclk_cyc = self.derive_clock(input_hz=target.sys_clk_freq, output_hz=bclk_frequency)
+        # TODO we could make fclk more accurate if it doesn't have to be an exact multiple of bclk maybe
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
         return iface.add_subtarget(TDMSubtarget(
             ports=iface.get_port_group(
