@@ -58,10 +58,21 @@ class GlasgowAnalyzer(Elaboratable):
         pin_ios = []
         self._ffsyncs = []
         for (name, triple) in self._pins:
-            sync_i = Signal.like(triple.i)
-            self._ffsyncs.append(FFSynchronizer(triple.i, sync_i))
-            pin_oes.append((name, triple.oe))
-            pin_ios.append((name, Mux(triple.oe, triple.o, sync_i)))
+            if hasattr(triple, 'i') and hasattr(triple, 'o'):
+                sync_i = Signal.like(triple.i)
+                self._ffsyncs.append(FFSynchronizer(triple.i, sync_i))
+                pin_oes.append((name, triple.oe))
+                pin_ios.append((name, Mux(triple.oe, triple.o, sync_i)))
+            elif hasattr(triple, 'i'):
+                sync_i = Signal.like(triple.i)
+                self._ffsyncs.append(FFSynchronizer(triple.i, sync_i))
+                pin_oes.append((name, Signal(1)))
+                pin_ios.append((name, sync_i))
+            elif hasattr(triple, 'o'):
+                pin_oes.append((name, triple.oe))
+                pin_ios.append((name, triple.o))
+            else:
+                assert False
 
         self.sig_oes = Cat(oe for n, oe in pin_oes)
         self.sig_ios = Cat(io for n, io in pin_ios)

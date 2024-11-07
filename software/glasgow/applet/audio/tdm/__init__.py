@@ -6,6 +6,22 @@ from amaranth.lib import io, fifo
 from ... import *
 from ....gateware.clockgen import ClockGen
 
+class TDMBus(Elaboratable):
+    def __init__(self, ports, clock_dir):
+        self.tx_buffer = io.Buffer("o", ports.tx)
+        self.rx_buffer = io.Buffer("i", ports.rx)
+        dir = 'o' if clock_dir == 'source' else 'i'
+        self.bclk_buffer = io.Buffer(dir, ports.bclk)
+        self.fsync_buffer = io.Buffer(dir, ports.fsync)
+    
+    def elaborate(self, platform):
+        m = Module()
+        m.submodules.tx_buffer = self.tx_buffer
+        m.submodules.rx_buffer = self.rx_buffer
+        m.submodules.bclk_buffer = self.bclk_buffer
+        m.submodules.fsync_buffer = self.fsync_buffer
+        return m
+
 class TDMSubtarget(Elaboratable):
     def __init__(self, ports, out_fifo, in_fifo, clock_dir, bclk_cyc, n_channels, n_bits, output_fsync_delay):
         self.ports = ports
@@ -17,8 +33,12 @@ class TDMSubtarget(Elaboratable):
         self.n_bits = n_bits
         self.output_fsync_delay = output_fsync_delay
 
+        self.bus = TDMBus(ports, clock_dir)
+
     def elaborate(self, platform):
         m = Module()
+
+        m.submodules.bus = self.bus
 
         bits_per_frame = self.n_channels * self.n_bits
         bytes_per_frame = self.n_channels * self.n_bits // 8
@@ -28,6 +48,7 @@ class TDMSubtarget(Elaboratable):
 
         # TODO we might want to output fsync for more than one bclk
         # TODO if we receive fsync we might want to make sure it only stays on for one bclk
+        # What happens if bclk and fsync are not perfectly synchonized?
 
         # TODO allow disabling one of rx and tx
 
@@ -41,19 +62,11 @@ class TDMSubtarget(Elaboratable):
             m.d.bclk += fsync_counter.eq(fsync_counter + 1)
             m.d.comb += fsync.eq(fsync_counter == 0)
 
-            m.submodules.bclk_buffer = bclk_buffer = io.Buffer("o", self.ports.bclk)
-            m.submodules.fsync_buffer = fsync_buffer = io.Buffer("o", self.ports.fsync)
-            m.d.comb += bclk_buffer.o.eq(m.submodules.clockgen.clk)
-            m.d.comb += fsync_buffer.o.eq(fsync)
+            m.d.comb += self.bus.bclk_buffer.o.eq(m.submodules.clockgen.clk)
+            m.d.comb += self.bus.fsync_buffer.o.eq(fsync)
         else:
             assert self.clock_dir == 'sink'
-            m.submodules.bclk_buffer = bclk_buffer = io.Buffer("i", self.ports.bclk)
-            m.submodules.fsync_buffer = fsync_buffer = io.Buffer("i", self.ports.fsync)
-            m.d.comb += cd_bclk.clk.eq(bclk_buffer.i)
-        
-        m.submodules.tx_buffer = tx_buffer = io.Buffer("o", self.ports.tx)
-        m.submodules.rx_buffer = rx_buffer = io.Buffer("i", self.ports.rx)
-
+            m.d.comb += cd_bclk.clk.eq(self.bus.bclk_buffer.i)
 
         # do we actually need those or could we use self.out_fifo._fifo.r_level? self.out_fifo might not be async though
 
@@ -95,13 +108,13 @@ class TDMSubtarget(Elaboratable):
         bits_valid_i = Signal(range(9))
         shreg_o = Signal(8)
         shreg_i = Signal(8)
-        m.d.comb += tx_buffer.o.eq(shreg_o[-1] & active_frame_imm)
+        m.d.comb += self.bus.tx_buffer.o.eq(shreg_o[-1] & active_frame_imm)
         
 
         # Shift data out of shreg_o and into shreg_i on every bclk
         with m.If(active_frame_imm):
             m.d.bclk += shreg_o.eq(Cat(C(0, 1), shreg_o))
-            m.d.bclk += shreg_i.eq(Cat(rx_buffer.i, shreg_i))
+            m.d.bclk += shreg_i.eq(Cat(self.bus.rx_buffer.i, shreg_i))
             m.d.bclk += bits_valid_o.eq(bits_valid_o - 1)
             m.d.bclk += bits_valid_i.eq(bits_valid_i + 1)
         
@@ -147,10 +160,10 @@ class TDMApplet(GlasgowApplet):
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access)
 
-        access.add_pin_argument(parser, "rx", default=True)
-        access.add_pin_argument(parser, "tx", default=True)
-        access.add_pin_argument(parser, "bclk", default=True)
-        access.add_pin_argument(parser, "fsync", default=True)
+        access.add_pin_argument(parser, "rx")
+        access.add_pin_argument(parser, "tx")
+        access.add_pin_argument(parser, "bclk", required=True)
+        access.add_pin_argument(parser, "fsync", required=True)
 
         parser.add_argument(
             "--clock-dir", metavar="DIR", choices=("source", "sink"),
@@ -175,7 +188,7 @@ class TDMApplet(GlasgowApplet):
         bclk_cyc = self.derive_clock(input_hz=target.sys_clk_freq, output_hz=bclk_frequency)
         # TODO we could make fclk more accurate if it doesn't have to be an exact multiple of bclk maybe
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
-        return iface.add_subtarget(TDMSubtarget(
+        subtarget = iface.add_subtarget(TDMSubtarget(
             ports=iface.get_port_group(
                 rx=args.pin_rx,
                 tx=args.pin_tx,
@@ -191,6 +204,14 @@ class TDMApplet(GlasgowApplet):
             output_fsync_delay=args.fsync_delay
             ))
         
+        # TODO: currently the FIFO immediately overruns before any data was sent. Workaround: reset device so that the applet has to be loaded first
+        if target.analyzer is not None:
+            target.analyzer.add_pin_event(self, "tx", subtarget.bus.tx_buffer)
+            target.analyzer.add_pin_event(self, "rx", subtarget.bus.rx_buffer)
+            target.analyzer.add_pin_event(self, "bclk", subtarget.bus.bclk_buffer)
+            target.analyzer.add_pin_event(self, "fsync", subtarget.bus.fsync_buffer)
+
+        return subtarget
 
     @classmethod
     def add_run_arguments(cls, parser, access):
