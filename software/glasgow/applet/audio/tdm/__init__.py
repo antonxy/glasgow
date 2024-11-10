@@ -24,7 +24,7 @@ class TDMBus(Elaboratable):
         return m
 
 class TDMSubtarget(Elaboratable):
-    def __init__(self, ports, out_fifo, in_fifo, clock_dir, bclk_cyc, n_channels, n_bits, output_fsync_delay):
+    def __init__(self, ports, out_fifo, in_fifo, clock_dir, bclk_cyc, n_channels, n_bits, output_fsync_delay, fsync_duration):
         self.ports = ports
         self.out_fifo = out_fifo
         self.in_fifo = in_fifo
@@ -33,6 +33,7 @@ class TDMSubtarget(Elaboratable):
         self.n_channels = n_channels
         self.n_bits = n_bits
         self.output_fsync_delay = output_fsync_delay
+        self.fsync_duration = fsync_duration
 
         self.bus = TDMBus(ports, clock_dir)
 
@@ -47,9 +48,10 @@ class TDMSubtarget(Elaboratable):
         m.domains.bclk = cd_bclk = ClockDomain("bclk")
         fsync = Signal()
 
-        # TODO we might want to output fsync for more than one bclk
-        # TODO if we receive fsync we might want to make sure it only stays on for one bclk
         # What happens if bclk and fsync are not perfectly synchonized?
+
+        # TODO detect buffer underflows / overflows and indicate error
+        # TODO detect errors such as too early fsync
 
         # TODO allow disabling one of rx and tx
 
@@ -61,7 +63,7 @@ class TDMSubtarget(Elaboratable):
             
             fsync_counter = Signal(range(bits_per_frame))
             m.d.bclk += fsync_counter.eq(fsync_counter + 1)
-            m.d.comb += fsync.eq(fsync_counter == 0)
+            m.d.comb += fsync.eq(fsync_counter < self.fsync_duration)
 
             m.d.comb += self.bus.bclk_buffer.o.eq(m.submodules.clockgen.clk)
             m.d.comb += self.bus.fsync_buffer.o.eq(fsync)
@@ -90,16 +92,23 @@ class TDMSubtarget(Elaboratable):
         full_frame_in_fifo = Signal()
         m.d.comb += full_frame_in_fifo.eq(m.submodules.o_fifo.r_level >= bytes_per_frame - 1) # -1 because we keep 1 byte in the fifo out register, I think. Maybe we have to actually check if a byte is present there
 
+        # Limit fsync length to one bclk internally
+        fsync_reg = Signal()
+        m.d.bclk += fsync_reg.eq(fsync)
+        fsync_rising = Signal()
+        m.d.comb += fsync_rising.eq(fsync & ~fsync_reg)
+
         active_frame = Signal()
-        with m.If(fsync):
+        with m.If(fsync_rising):
             # Set the frame as active only if we have a full frame of data available in the fifo
             m.d.bclk += active_frame.eq(full_frame_in_fifo)
             # TODO maybe the inverse for i_fifo. Only activate if there is space for a full frame
             # TODO maybe we could count frame drops here and report them
 
+        # If output_fsync_delay is set to zero we want full_frame_in_fifo to immediately set active_frame, not after one bclk
         active_frame_imm = Signal()
         if self.output_fsync_delay == 0:
-            m.d.comb += active_frame_imm.eq(Mux(fsync, full_frame_in_fifo, active_frame))
+            m.d.comb += active_frame_imm.eq(Mux(fsync_rising, full_frame_in_fifo, active_frame))
             # TODO active_frame_imm maybe also has to deassert one bclk earlier than active_frame
         elif self.output_fsync_delay == 1:
             m.d.comb += active_frame_imm.eq(active_frame)
