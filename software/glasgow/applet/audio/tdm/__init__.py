@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import argparse
 from amaranth import *
 from amaranth.lib import io, fifo
 
@@ -220,14 +221,54 @@ class TDMApplet(GlasgowApplet):
     async def run(self, device, args):
         iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args)
         return iface
+    
+    @classmethod
+    def add_interact_arguments(cls, parser):
+        parser.add_argument(
+            "-l", "--loop", action='store_true',
+            help="loop the txfile until the command is aborted")
+
+        parser.add_argument(
+            "--txfile", type=argparse.FileType('rb'),
+            help="raw audio file to transmit")
+
+        parser.add_argument(
+            "--rxfile", type=argparse.FileType('wb'),
+            help="raw audio file to record to")
 
     async def interact(self, device, args, iface):
-        test_data = [0xFF, 0x00, 0x01, 0x02] * 2
-        print(test_data)
-        await iface.write(test_data)
-        print(bytes(await iface.read(len(test_data))))
-        await iface.write(test_data)
-        print(bytes(await iface.read(len(test_data))))
+        # TODO It looks like at least one byte is stuck in the applet at the end and not returned
+        # It will be returned at the beginning of the next run
+
+        async def write_task():
+            if args.txfile:
+                pcm_data = args.txfile.read()
+                bytes_written = 0
+                while True:
+                    bytes_written += len(pcm_data)
+                    await iface.write(pcm_data)
+                    # Somehow if I don't call flush here nothing happens even though the writes get submitted
+                    # I think it would make sense if I would only have to call flush once in the very end
+                    await iface.flush(wait=False) 
+                    if not args.loop:
+                        break
+                await iface.flush(wait=False)
+                return bytes_written
+
+        async def read_task(write_future):
+            if args.rxfile:
+                bytes_read = 0
+                while not write_future.done() or bytes_read < write_future.result():
+
+                    #TODO Can this get stuck waiting for one more byte even though the condition is satisfied somehow?
+                    # flush=False has to be set, otherwise it can deadlock with the write task I think
+                    d = bytes(await iface.read(flush=False)) 
+                    bytes_read += len(d)
+                    args.rxfile.write(d)
+
+        write_future = asyncio.create_task(write_task())
+        read_future = asyncio.create_task(read_task(write_future))
+        await asyncio.gather(write_future, read_future)
 
     @classmethod
     def tests(cls):
