@@ -24,7 +24,7 @@ class TDMBus(Elaboratable):
         return m
 
 class TDMSubtarget(Elaboratable):
-    def __init__(self, ports, out_fifo, in_fifo, clock_dir, bclk_cyc, n_channels, n_bits, output_fsync_delay, fsync_duration):
+    def __init__(self, ports, out_fifo, in_fifo, clock_dir, bclk_cyc, n_channels, n_bits, output_fsync_delay, fsync_duration, extra_cycles):
         self.ports = ports
         self.out_fifo = out_fifo
         self.in_fifo = in_fifo
@@ -34,6 +34,7 @@ class TDMSubtarget(Elaboratable):
         self.n_bits = n_bits
         self.output_fsync_delay = output_fsync_delay
         self.fsync_duration = fsync_duration
+        self.extra_cycles = extra_cycles
 
         self.bus = TDMBus(ports, clock_dir)
 
@@ -55,14 +56,20 @@ class TDMSubtarget(Elaboratable):
 
         # TODO allow disabling one of rx and tx
 
+        fsync_counter = Signal(range(bits_per_frame * 4))
+
         # Generate or import bit clock
         if self.clock_dir == 'source':
             # TODO maybe better to use a PLL?
             m.submodules.clockgen = ClockGen(self.bclk_cyc)
             m.d.comb += cd_bclk.clk.eq(m.submodules.clockgen.clk)
+
+            frame_duration = bits_per_frame + self.extra_cycles
             
-            fsync_counter = Signal(range(bits_per_frame))
-            m.d.bclk += fsync_counter.eq(fsync_counter + 1)
+            with m.If(fsync_counter < frame_duration - 1):
+                m.d.bclk += fsync_counter.eq(fsync_counter + 1)
+            with m.Else():
+                m.d.bclk += fsync_counter.eq(0)
             m.d.comb += fsync.eq(fsync_counter < self.fsync_duration)
 
             m.d.comb += self.bus.bclk_buffer.o.eq(m.submodules.clockgen.clk)
@@ -70,6 +77,13 @@ class TDMSubtarget(Elaboratable):
         else:
             assert self.clock_dir == 'sink'
             m.d.comb += cd_bclk.clk.eq(self.bus.bclk_buffer.i)
+            m.d.comb += fsync.eq(self.bus.fsync_buffer.i)
+            with m.If(fsync):
+                # TODO this should happen immediately, not after one bclk
+                m.d.bclk += fsync_counter.eq(0)
+                # TODO could report number of bits per fsync here
+            with m.ElIf(fsync_counter < 2**fsync_counter.width-2):
+                m.d.bclk += fsync_counter.eq(fsync_counter + 1)
 
         # do we actually need those or could we use self.out_fifo._fifo.r_level? self.out_fifo might not be async though
 
@@ -90,7 +104,11 @@ class TDMSubtarget(Elaboratable):
             m.d.comb += self.in_fifo.w_data.eq(i_fifo.r_data)
 
         full_frame_in_fifo = Signal()
-        m.d.comb += full_frame_in_fifo.eq(m.submodules.o_fifo.r_level >= bytes_per_frame - 1) # -1 because we keep 1 byte in the fifo out register, I think. Maybe we have to actually check if a byte is present there
+        m.d.comb += full_frame_in_fifo.eq(m.submodules.o_fifo.r_level >= bytes_per_frame - 2) # -2 because we keep 1 byte in the fifo out register, I think. And one somewhere else? Maybe I have to actually think this through
+
+        space_for_full_frame_in_fifo = Signal()
+        m.d.comb += space_for_full_frame_in_fifo.eq(m.submodules.i_fifo.w_level >= 0)
+
 
         # Limit fsync length to one bclk internally
         fsync_reg = Signal()
@@ -101,7 +119,8 @@ class TDMSubtarget(Elaboratable):
         active_frame = Signal()
         with m.If(fsync_rising):
             # Set the frame as active only if we have a full frame of data available in the fifo
-            m.d.bclk += active_frame.eq(full_frame_in_fifo)
+            # Otherwise we might read part of a frame from the fifo and mess up the framing
+            m.d.bclk += active_frame.eq(full_frame_in_fifo & space_for_full_frame_in_fifo)
             # TODO maybe the inverse for i_fifo. Only activate if there is space for a full frame
             # TODO maybe we could count frame drops here and report them
 
@@ -112,17 +131,25 @@ class TDMSubtarget(Elaboratable):
             # TODO active_frame_imm maybe also has to deassert one bclk earlier than active_frame
         elif self.output_fsync_delay == 1:
             m.d.comb += active_frame_imm.eq(active_frame)
-        # TODO stop active_frame if the next fsync is not coming, i.e. count how many bits we already shifted out
+        else:
+            assert False
+        
+        # Stop shifting data in/out if we have reached the number of bits per frame
+        # TODO maybe this can be combined into active_frame_imm
+        still_shifting = Signal()
+        m.d.comb += still_shifting.eq(fsync_counter < bits_per_frame + self.output_fsync_delay)
+
+        # TODO detect if fsync comes before bits per frame is reached
 
         bits_valid_o = Signal(range(9))
         bits_valid_i = Signal(range(9))
         shreg_o = Signal(8)
         shreg_i = Signal(8)
-        m.d.comb += self.bus.tx_buffer.o.eq(shreg_o[-1] & active_frame_imm)
+        m.d.comb += self.bus.tx_buffer.o.eq(shreg_o[-1] & active_frame_imm & still_shifting)
         
 
         # Shift data out of shreg_o and into shreg_i on every bclk
-        with m.If(active_frame_imm):
+        with m.If(active_frame_imm & still_shifting):
             m.d.bclk += shreg_o.eq(Cat(C(0, 1), shreg_o))
             m.d.bclk += shreg_i.eq(Cat(self.bus.rx_buffer.i, shreg_i))
             m.d.bclk += bits_valid_o.eq(bits_valid_o - 1)
@@ -132,7 +159,7 @@ class TDMSubtarget(Elaboratable):
         with m.If(bits_valid_i >= 8):
             m.d.bclk += i_fifo.w_data.eq(shreg_i)
             m.d.bclk += i_fifo.w_en.eq(1)
-            with m.If(active_frame_imm):  # If we also shifted in data in this cycle
+            with m.If(active_frame_imm & still_shifting):  # If we also shifted in data in this cycle
                 m.d.bclk += bits_valid_i.eq(1)
             with m.Else():
                 m.d.bclk += bits_valid_i.eq(0)
@@ -191,12 +218,23 @@ class TDMApplet(GlasgowApplet):
         parser.add_argument(
             "--fsync-delay", metavar="DEL", choices=(0, 1), default=0,
             help="output is valid DEL bclk cycles after fsync rising edge (default: %(default)s)")
+        
+        # TODO these only have an effect in clock souce mode, complain if they are set in sink mode
+        parser.add_argument(
+            "--fsync-duration", type=int, default=1,
+            help="duration of the generated fsync pulse in bclk cycles (default: %(default)s)")
+        parser.add_argument(
+            "--extra-cycles", type=int, default=0,
+            help="number of bclk cycles after a frame is sent before the next fsync pulse in generated (default: %(default)s)")
 
     def build(self, target, args):
         assert args.bit_depth % 8 == 0
         bclk_frequency = args.sample_rate * args.channels * args.bit_depth
         bclk_cyc = self.derive_clock(input_hz=target.sys_clk_freq, output_hz=bclk_frequency)
         # TODO we could make fclk more accurate if it doesn't have to be an exact multiple of bclk maybe
+
+        assert args.fsync_duration > 0 and args.fsync_duration < args.channels * args.bit_depth
+
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
         subtarget = iface.add_subtarget(TDMSubtarget(
             ports=iface.get_port_group(
@@ -211,11 +249,13 @@ class TDMApplet(GlasgowApplet):
             bclk_cyc=bclk_cyc,
             n_channels=args.channels,
             n_bits=args.bit_depth,
-            output_fsync_delay=args.fsync_delay
+            output_fsync_delay=args.fsync_delay,
+            fsync_duration=args.fsync_duration,
+            extra_cycles=args.extra_cycles
             ))
         
         # TODO: currently the FIFO immediately overruns before any data was sent. Workaround: reset device so that the applet has to be loaded first
-        if target.analyzer is not None:
+        if hasattr(target, 'analyzer') and target.analyzer is not None:
             target.analyzer.add_pin_event(self, "tx", subtarget.bus.tx_buffer)
             target.analyzer.add_pin_event(self, "rx", subtarget.bus.rx_buffer)
             target.analyzer.add_pin_event(self, "bclk", subtarget.bus.bclk_buffer)
