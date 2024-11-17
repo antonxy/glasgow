@@ -83,15 +83,34 @@ class TDMSubtarget(Elaboratable):
             m.d.comb += cd_bclk.clk.eq(self.bus.bclk_buffer.i)
             m.d.comb += fsync.eq(self.bus.fsync_buffer.i)
 
-            # If we are the clock sink the fsync_counter is driven by fsync
-            # TODO this should happen immediately, not after one bclk
-            m.d.bclk += fsync_counter.eq(Mux(fsync, 0, Mux(fsync_counter < 2**len(fsync_counter)-2, fsync_counter + 1, fsync_counter)))
-            # TODO could report number of bits per fsync here
-            # TODO Also doesn't behave correctly with fsync longer that 1 bclk, should use the fsync_rising signal
 
-        # do we actually need those or could we use self.out_fifo._fifo.r_level? self.out_fifo might not be async though
+        # Limit fsync length to one bclk internally
+        fsync_reg = Signal()
+        m.d.bclk += fsync_reg.eq(fsync)
+        fsync_rising = Signal()
+        m.d.comb += fsync_rising.eq(fsync & ~fsync_reg)
+
+        if self.clock_dir == 'sink':
+            # If we are the clock sink the fsync_counter is driven by fsync
+
+            if self.output_fsync_delay == 0:
+                fsync_counter_reg = Signal(range(bits_per_frame * 4))
+                m.d.bclk += fsync_counter_reg.eq(Mux(fsync_counter < 2**len(fsync_counter)-2, fsync_counter + 1, fsync_counter))
+                m.d.comb += fsync_counter.eq(Mux(fsync_rising, 0, fsync_counter_reg))
+            else:
+                m.d.bclk += fsync_counter.eq(
+                    Mux(fsync_rising,
+                        0,
+                        Mux(fsync_counter < 2**len(fsync_counter)-2,
+                             fsync_counter + 1,
+                             fsync_counter
+                        )
+                    )
+                )
+            # TODO could report number of bits per fsync here
 
         # fifos for transfer between sync domain and bclk domain
+        # do we actually need those or could we use self.out_fifo._fifo.r_level? self.out_fifo might not be async though
         
         if self.bus.tx_buffer != None:
             m.submodules.o_fifo = o_fifo = fifo.AsyncFIFO(width=8, depth=bytes_per_frame, r_domain='bclk', w_domain='sync')
@@ -115,15 +134,9 @@ class TDMSubtarget(Elaboratable):
                 m.d.comb += self.in_fifo.w_data.eq(i_fifo.r_data)
 
             space_for_full_frame_in_fifo = Signal()
-            m.d.comb += space_for_full_frame_in_fifo.eq(m.submodules.i_fifo.w_level == 0)
+            m.d.comb += space_for_full_frame_in_fifo.eq(m.submodules.i_fifo.w_level <= 1) # TODO just put one to make it work, but is that valid?
         else:
             space_for_full_frame_in_fifo = Const(1)
-
-        # Limit fsync length to one bclk internally
-        fsync_reg = Signal()
-        m.d.bclk += fsync_reg.eq(fsync)
-        fsync_rising = Signal()
-        m.d.comb += fsync_rising.eq(fsync & ~fsync_reg)
 
         active_frame = Signal()
         with m.If(fsync_rising):
