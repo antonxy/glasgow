@@ -66,7 +66,7 @@ class GlasgowAnalyzer(Elaboratable):
             elif hasattr(triple, 'i'):
                 sync_i = Signal.like(triple.i)
                 self._ffsyncs.append(FFSynchronizer(triple.i, sync_i))
-                pin_oes.append((name, Signal(1)))
+                pin_oes.append((name, Signal(0)))
                 pin_ios.append((name, sync_i))
             elif hasattr(triple, 'o'):
                 pin_oes.append((name, triple.oe))
