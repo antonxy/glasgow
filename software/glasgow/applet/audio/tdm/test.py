@@ -67,22 +67,40 @@ class TDMAppletTestCase(GlasgowAppletTestCase, applet=TDMApplet):
         m = Module()
         m.d.comb += ports.rx.i.eq(ports.tx.o)
         self.target.add_submodule(m)
+    
+    async def check_loopback(self, frame_size=4):
+        tdm_iface = await self.run_simulated_applet()
+
+        test_data = bytes([i for i in range(frame_size)])
+
+        await tdm_iface.write(test_data)
+        result = await tdm_iface.read(len(test_data))
+        self.assertEqual(result, test_data)
+
+        await tdm_iface.write(test_data)
+        result = await tdm_iface.read(len(test_data))
+        self.assertEqual(result, test_data)
 
     @applet_simulation_test("setup_loopback", ['--pin-bclk', "0", '--pin-fsync', "1", '--pin-rx', "2", '--pin-tx', "3"])
     async def test_loopback(self):
-        tdm_iface = await self.run_simulated_applet()
+        await self.check_loopback()
+    
+    @applet_simulation_test("setup_loopback", ['--pin-bclk', "0", '--pin-fsync', "1", '--pin-rx', "2", '--pin-tx', "3", '--fsync-delay', '1'])
+    async def test_loopback2(self):
+        await self.check_loopback()
 
-        test_data = b"\xFF\x00\x01\x02" * 2
+    @applet_simulation_test("setup_loopback", ['--pin-bclk', "0", '--pin-fsync', "1", '--pin-rx', "2", '--pin-tx', "3", '--fsync-duration', '6'])
+    async def test_loopback3(self):
+        await self.check_loopback()
 
-        await tdm_iface.write(test_data)
-        result = await tdm_iface.read(len(test_data))
-        self.assertEqual(result, test_data)
+    @applet_simulation_test("setup_loopback", ['--pin-bclk', "0", '--pin-fsync', "1", '--pin-rx', "2", '--pin-tx', "3", '--extra-cycles', '6'])
+    async def test_loopback4(self):
+        await self.check_loopback()
 
-        await tdm_iface.write(test_data)
-        result = await tdm_iface.read(len(test_data))
-        self.assertEqual(result, test_data)
+    @applet_simulation_test("setup_loopback", ['--pin-bclk', "0", '--pin-fsync', "1", '--pin-rx', "2", '--pin-tx', "3", '--channels', '3', '--bit-depth', '24'])
+    async def test_loopback4(self):
+        await self.check_loopback(frame_size=9)
 
-        # TODO test buffer underflow
 
 # This is currently not loaded by `glasgow test` but can be run using `python -m unittest`
 class TDMMultiAppletTestCase(MultiAppletTestCase):
