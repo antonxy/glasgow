@@ -118,7 +118,7 @@ class TDMSubtarget(Elaboratable):
             with m.If(o_fifo.w_rdy & self.out_fifo.r_rdy):
                 m.d.comb += o_fifo.w_en.eq(1)
                 m.d.comb += self.out_fifo.r_en.eq(1)
-                m.d.sync += o_fifo.w_data.eq(self.out_fifo.r_data) # TODO why is this one sync, but in the other direction comb? Works, but suspicious
+                m.d.comb += o_fifo.w_data.eq(self.out_fifo.r_data)
 
             full_frame_in_fifo = Signal()
             m.d.comb += full_frame_in_fifo.eq(m.submodules.o_fifo.r_level >= bytes_per_frame - 2) # -2 because we keep 1 byte in the fifo out register, I think. And one somewhere else? Maybe I have to actually think this through
@@ -177,23 +177,12 @@ class TDMSubtarget(Elaboratable):
                 m.d.bclk += bits_valid_o.eq(bits_valid_o - 1)
             
             # Get new transmit byte
-            #TODO did I misunderstand fifo docs here? r_rdy means that data is already in r_data and r_en will put in the next one
-            # or does it? I see r_rdy asserted and r_data contains nothing
-            # maybe this mistake and the comb sync thing above cancel each other?
-            # maybe this can be simplified by fixing both
-            with m.FSM(name="shreg_o_refill", domain="bclk"):
-                with m.State("Wait"):
-                    # Read a byte from the fifo as soon as it is available, it will be kept in r_data until we need it
-                    with m.If(o_fifo.r_rdy):
-                        m.d.comb += o_fifo.r_en.eq(1)
-                        m.next = "Read"
-                with m.State("Read"):
-                    # When the shift register is empty refill it from r_data
-                    with m.If(bits_valid_o <= 1):
-                        m.d.bclk += shreg_o.eq(o_fifo.r_data)
-                        m.d.bclk += bits_valid_o.eq(8)
-
-                        m.next = "Wait"
+            # I misunderstood fifo docs here. r_rdy means that data is already in r_data and r_en will put in the next one
+            with m.If((bits_valid_o <= 1) & o_fifo.r_rdy): # TODO maybe we should compare to 1 only if we were shifing out a byte in this cycle
+                m.d.bclk += shreg_o.eq(o_fifo.r_data)
+                m.d.bclk += bits_valid_o.eq(8)
+            m.d.bclk += o_fifo.r_en.eq(Mux((bits_valid_o <= 1) & o_fifo.r_rdy, 1, 0))
+            
 
         if self.bus.rx_buffer != None:
             bits_valid_i = Signal(range(9))
@@ -246,7 +235,7 @@ class TDMApplet(GlasgowApplet):
             "-d", "--bit-depth", type=int, default=16,
             help="bit depth, only multiples of 8 are supported (default: %(default)s)")
         parser.add_argument(
-            "--fsync-delay", metavar="DEL", choices=(0, 1), default=0,
+            "--fsync-delay", type=int, metavar="DEL", choices=(0, 1), default=0,
             help="output is valid DEL bclk cycles after fsync rising edge (default: %(default)s)")
         
         # TODO these only have an effect in clock souce mode, complain if they are set in sink mode
