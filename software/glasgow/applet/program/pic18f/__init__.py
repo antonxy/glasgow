@@ -18,18 +18,15 @@ from glasgow.applet.control.gpio import GPIOInterface
 from glasgow.abstract import AbstractAssembly, GlasgowPin, ClockDivisor
 from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
 
-# Command structure in fifo:
-# byte 1: internal command, pic 4 bit command
+# Command structure in host -> glasgow fifo:
+# byte 1: internal command
 # byte 2: pic 4 bit command
 # byte 3,4: pic 16bit payload
-# combine byte 1 and 2? Or is it easier if they are separate?
 
-# internal commands:
-# Read, Write, Delay
+# Command structure in glasgow -> host fifo:
+# byte 1: read byte
 
-# For every command in the in fifo, 2 bytes are sent in the out fifo
-# 
-
+# Internal commands:
 # bit 0 indicates pgd oe
 # bit 1 indicates programming clock stretch
 # bit 2 indicates erase clock stretch
@@ -110,7 +107,7 @@ class DataShifter(wiring.Component):
         with m.Else():
             m.d.sync += timer.eq(0)
 
-        # TODO is oe set at the right time for reads?
+        # Enable data output while clock is active, unless we are in the last 8 bytes for a read
         m.d.comb += buffer_pgd.oe.eq(cycling & ((clock_cycles > 16) | (~self.is_read)))
 
         last_clock = Signal(1)
@@ -246,14 +243,6 @@ class ProgramPIC18fInterface:
         # No sleep required, P18 = 0s
         await self._pgm_iface.output(0, True)
 
-    # TODO offer an API where a bunch of reads/ writes can be queued up without flushing inbetween all the time
-    async def read(self, cmd_4bit):
-        cmd = CMD_READ << 4 | cmd_4bit & 0xf
-        payload = 0x0000
-        await self._pipe.send(struct.pack("<BH", cmd, payload))
-        await self._pipe.flush()
-        return (await self._pipe.recv(1))[0]
-
     async def read_n(self, cmd_4bit, n):
         cmd = CMD_READ << 4 | cmd_4bit & 0xf
         payload = 0x0000
@@ -265,12 +254,10 @@ class ProgramPIC18fInterface:
     async def write(self, cmd_4bit, payload):
         cmd = CMD_WRITE << 4 | cmd_4bit & 0xf
         await self._pipe.send(struct.pack("<BH", cmd, payload))
-        await self._pipe.flush()
 
     async def write_program(self, cmd_4bit, payload):
         cmd = CMD_WRITE_PROGRAM << 4 | cmd_4bit & 0xf
         await self._pipe.send(struct.pack("<BH", cmd, payload))
-        await self._pipe.flush()
 
     async def sync(self):
         # Do a read on a nop instruction
@@ -280,30 +267,25 @@ class ProgramPIC18fInterface:
         await self._pipe.flush()
         await self._pipe.recv(1)
 
-    async def set_tblptr(self, addr):
-        addr_h = (addr >> 16) & 0xff
-        addr_m = (addr >> 8) & 0xff
-        addr_l = (addr >> 0) & 0xff
-        await self.write(0b0000, 0x0E << 8 | addr_h)
-        await self.write(0b0000, 0x6EF8)
-        await self.write(0b0000, 0x0E << 8 | addr_m)
-        await self.write(0b0000, 0x6EF7)
-        await self.write(0b0000, 0x0E << 8 | addr_l)
-        await self.write(0b0000, 0x6EF6)
-
-    async def read_device_id(self):
-        # Set TBLPTR = 0x3ffffe
-        await self.set_tblptr(0x3ffffe)
-        devid1, devid2 = await self.read_n(0b1001, 2)
-        return devid1, devid2
-
     async def run_commands(self, command_table):
         commands = bytearray()
         for (cmd_4bit, payload) in command_table:
             cmd = CMD_WRITE << 4 | cmd_4bit & 0xf
             commands.extend(struct.pack("<BH", cmd, payload))
         await self._pipe.send(commands)
-        await self._pipe.flush()
+
+    async def set_tblptr(self, addr):
+        addr_h = (addr >> 16) & 0xff
+        addr_m = (addr >> 8) & 0xff
+        addr_l = (addr >> 0) & 0xff
+        await self.run_commands([
+            (0b0000, 0x0E << 8 | addr_h),
+            (0b0000, 0x6EF8),
+            (0b0000, 0x0E << 8 | addr_m),
+            (0b0000, 0x6EF7),
+            (0b0000, 0x0E << 8 | addr_l),
+            (0b0000, 0x6EF6),
+        ])
 
     async def erase(self):
         self._logger.info("Performing bulk chip erase")
@@ -321,24 +303,23 @@ class ProgramPIC18fInterface:
             (0b0000, 0x6EF7), # MOVWF TBLPTRH
             (0b0000, 0x0E04), # MOVLW 04h
             (0b0000, 0x6EF6), # MOVWF TBLPTRL
-            (0b1100, 0x8F8F), # Write 8F8Fh TO 3C0004h to erase entire device. # TODO other codes exist to erase certain sections
+            (0b1100, 0x8F8F), # Write 8F8Fh TO 3C0004h to erase entire device. Other codes exist to erase certain sections
             (0b0000, 0x0000), # NOP
-            # (0b0000, 0x0000), # Hold PGD low until erase completes. # TODO clock stretch command
         ])
 
         cmd = CMD_WRITE_ERASE << 4 | 0b0000 & 0xf
         await self._pipe.send(struct.pack("<BH", cmd, 0))
-        await self._pipe.flush()
     
     async def program_line(self, line_address, bytes):
-        self._logger.info(f"Program line at: %#08x", line_address)
+        assert line_address % 16 == 0
+        assert len(bytes) == 16 # TODO this is for PIC18F14K50
+
         await self.run_commands([
             (0b0000, 0x8EA6), # BSF EECON1, EEPGD
             (0b0000, 0x9CA6), # BCF EECON1, CFGS
             (0b0000, 0x84A6), # BSF EECON1, WREN
         ])
         await self.set_tblptr(line_address)
-        assert(len(bytes) == 16) # TODO this is for PIC18F14K50
 
         commands = []
         for i in range(len(bytes)//2):
@@ -351,27 +332,15 @@ class ProgramPIC18fInterface:
         await self.run_commands(commands)
         await self.write_program(0b0000, 0)
 
-        #TODO program does program something, but not correctly. Looks like the programmed bytes are shifted and some extra ones added or something
-        #Something might still be wrong with the read actually
-        #It looks like only every second byte is written/read
-        #And the first bit of read seems to be influenced by payload, even though oe is 0.
-        # Maybe it needs a delay before reading the byte
+        # TODO configuration lines need a longer clock stretch
 
     async def read_memory(self, address, n_bytes):
         await self.set_tblptr(address)
         return await self.read_n(0b1001, n_bytes)
 
-    async def program_memory(self, address, data):
-        # For now I am not handling programming that's not aligned to flash lines
-        # It could be handled by first reading that line, updating the bits, and writing it again
-        assert address % 16 == 0
-        assert len(data) % 16 == 0
-
-        # TODO maybe I should also check that memory was erased before programming
-
-        for i in range(len(data) // 16):
-            chunk = data[i * 16:(i+1) * 16]
-            await self.program_line(address + i * 16, chunk)
+    async def read_device_id(self):
+        devid1, devid2 = await self.read_memory(0x3ffffe, 2)
+        return devid1, devid2
 
 
 pic18f_device_ids = {
@@ -423,6 +392,9 @@ class ProgramPIC18fApplet(GlasgowAppletV2):
             await self.pic_iface._clock.set_frequency(1e6)
             await self.pic_iface.enter_low_voltage_program_mode()
 
+            # TODO: get from device id
+            line_length = 16
+
             if args.operation == "device-id":
                 devid1, devid2 = await self.pic_iface.read_device_id()
                 self.logger.info(f"DEVID1: %#02x, DEVID2: %#02x", devid1, devid2)
@@ -438,13 +410,85 @@ class ProgramPIC18fApplet(GlasgowAppletV2):
                 await self.pic_iface.erase()
 
             if args.operation == "program":
+                def ceildiv(a, b):
+                    return -(a // -b)
+
+                class FlashLine:
+                    read_data = 0
+                    write_data = 0
+                    write_mask = 0
+
+                    def update(self, new_write, new_mask):
+                        overlap = (new_mask & self.write_mask)
+                        assert (self.write_data & overlap) == (new_write & overlap)
+                        self.write_data = self.write_data & self.write_mask | new_write & new_mask 
+
+                all_ones = int.from_bytes([0xff] * line_length)
+
+                # Make a list of all lines we want to (partially) write to
+                lines = {} # key: line address, value = (read data, write data, write_mask)
                 for chunk_mem_addr, chunk_data in sorted(input_data(args.file, fmt="ihex"),
                                                          key=lambda c: c[0]):
-                    self.logger.info("Write %d bytes to %#06x", len(chunk_data), chunk_mem_addr)
-                    # TODO next steps:
-                    # - Implement writing a single line of flash (Weird stuff with pulling clock high and low)
-                    # - Read back that line to see if it worked
-                    # - Then implement programming from the hex file
+                    if len(chunk_data) == 0: continue
+                    first_full_line_number = ceildiv(chunk_mem_addr, line_length)
+                    last_full_line_number_exclusive = (chunk_mem_addr + len(chunk_data) - 1) // line_length
+
+                    pre_extra_bytes = first_full_line_number * line_length - chunk_mem_addr
+                    post_extra_bytes = (chunk_mem_addr + len(chunk_data)) - last_full_line_number_exclusive * line_length
+
+                    if pre_extra_bytes > 0:
+                        line = lines.setdefault(first_full_line_number - 1, FlashLine())
+                        line_data = chunk_data[0:pre_extra_bytes]
+                        write_data = int.from_bytes([0x00] * (line_length - pre_extra_bytes) + line_data)
+                        write_mask = int.from_bytes([0x00] * (line_length - pre_extra_bytes) + [0xff] * pre_extra_bytes)
+                        line.update(write_data, write_mask)
+
+                    for line_number in range(first_full_line_number, last_full_line_number_exclusive):
+                        line = lines.setdefault(line_number, FlashLine())
+                        line_data = chunk_data[line_number*16+pre_extra_bytes:(line_number + 1)*16+pre_extra_bytes]
+                        write_data = int.from_bytes(line_data)
+                        write_mask = all_ones
+                        line.update(write_data, write_mask)
+
+                    if post_extra_bytes > 0:
+                        line = lines.setdefault(last_full_line_number_exclusive, FlashLine())
+                        line_data = chunk_data[-post_extra_bytes:]
+                        write_data = int.from_bytes(line_data + [0x00] * (line_length - post_extra_bytes))
+                        write_mask = int.from_bytes([0xff] * post_extra_bytes + [0x00] * (line_length - post_extra_bytes))
+                        line.update(write_data, write_mask)
+
+                self.logger.info("Reading memory to check write compatibility")
+                for line_number, line in lines.items():
+                    line_read = await self.pic_iface.read_memory(line_number * line_length, line_length)
+                    line.read_data = int.from_bytes(line_read)
+
+                    # Check that the write is compatible with the data already in memory (no further erase needed)
+                    write_ok = (line.read_data | all_ones - line.write_data | all_ones - line.write_mask) == all_ones
+                    if not write_ok:
+                        print(hex(line_number * line_length))
+                        print(line.read_data.to_bytes(line_length), line.write_data.to_bytes(line_length), line.write_mask.to_bytes(line_length))
+                        raise RuntimeError("Incompatible write into a memory location that was not erased")
+
+                self.logger.info("Writing %d lines / %d bytes of memory", len(lines), len(lines) * line_length)
+                for line_number, line in lines.items():
+                    line_data = (line.read_data & (all_ones - line.write_mask)) | (line.write_data & line.write_mask)
+                    if line_data != line.read_data: # Check if there is any data to write
+                        await self.pic_iface.program_line(line_number * line_length, line_data.to_bytes(line_length))
+
+                await self.pic_iface.sync() # wait for writes to be done before printing message
+                self.logger.info("Reading back memory")
+                for line_number, line in lines.items():
+                    line_data = (line.read_data & (all_ones - line.write_mask)) | (line.write_data & line.write_mask)
+                    readback = await self.pic_iface.read_memory(line_number * line_length, line_length)
+                    if readback != line_data.to_bytes(line_length):
+                        raise RuntimeError(f"Incorrect readback at address 0x{line_number * line_length:06x}")
+
+
+                self.logger.info("Reading back memory again to check internal logic")
+                for chunk_mem_addr, chunk_data in sorted(input_data(args.file, fmt="ihex"),
+                                                         key=lambda c: c[0]):
+                    readback = await self.pic_iface.read_memory(chunk_mem_addr, chunk_data)
+                    assert readback.tobytes() == chunk_data
 
 
         finally:
