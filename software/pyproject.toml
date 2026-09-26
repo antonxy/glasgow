@@ -171,6 +171,7 @@ display-hd44780 = "glasgow.applet.display.hd44780:DisplayHD44780Applet"
 
 audio-dac = "glasgow.applet.audio.dac:AudioDACApplet"
 audio-yamaha-opx = "glasgow.applet.audio.yamaha_opx:AudioYamahaOPxApplet [http]"
+audio-tdm = "glasgow.applet.audio.tdm:TDMApplet"
 
 video-hub75-output = "glasgow.applet.video.hub75_output:VideoHub75OutputApplet"
 video-rgb-input = "glasgow.applet.video.rgb_input:VideoRGBInputApplet"
