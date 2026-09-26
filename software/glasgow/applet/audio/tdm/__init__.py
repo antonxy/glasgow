@@ -14,7 +14,6 @@ from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
 
 __all__ = ["TDMComponent", "TDMApplet"]
 
-
 class TDMFrontend(wiring.Component):
     '''
     Shifts frame_bits bits in/out, keeps alignment with fsync.
@@ -54,6 +53,11 @@ class TDMFrontend(wiring.Component):
         )
         wiring.connect(m, wiring.flipped(self.rx_stream), fifo.o)
 
+        fsync_rising = Signal(1)
+        last_fsync = Signal(1)
+        m.d.bclk += last_fsync.eq(fsync_buffer.i)
+        m.d.comb += fsync_rising.eq(fsync_buffer.i & ~last_fsync)
+
         shift = Signal(1)
         shift_done = Signal(1)
         with m.If(shift):
@@ -78,8 +82,8 @@ class TDMFrontend(wiring.Component):
 
         with m.FSM(domain='bclk'):
             with m.State("Wait-fsync"):
-                with m.If(fsync_buffer.i):
-                    # shift first bit
+                with m.If(fsync_rising):
+                    # shift first bit immediately
                     m.d.comb += shift.eq(1)
                     m.next = "Shift-Frame"
                 pass
@@ -91,6 +95,8 @@ class TDMFrontend(wiring.Component):
                 pass
             with m.State("Fsync-early"):
                 # Fsync received too early, send zeros and wait for next fsync
+                # Once we have tx also, we will have to discard some tx bytes here
+                # Have to be careful to keep rx/tx delay fixed ideally
                 # TODO how do I best report this?
                 # A flag in a register?
                 # An extra byte with each frame with status bits?
@@ -103,6 +109,7 @@ class TDMFrontend(wiring.Component):
         return m
 
 
+# TODO maybe I don't need this wrapper
 class TDMComponent(wiring.Component):
     o_stream: Out(stream.Signature(8))
 
@@ -127,6 +134,7 @@ class TDMInterface:
                  frame_bytes):
         self._logger = logger
         self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
+        self._frame_bytes = frame_bytes
 
         ports = assembly.add_port_group(bclk=bclk, fsync=fsync, rx=rx)
         component = assembly.add_submodule(TDMComponent(ports, frame_bytes))
@@ -134,6 +142,11 @@ class TDMInterface:
 
     def _log(self, message, *args):
         self._logger.log(self._level, "SPI analyzer: " + message, *args)
+
+    async def read_frame(self):
+        return (await self._pipe.recv(self._frame_bytes)).tobytes()
+
+    # Maybe have a play/rec/playrec interface like the sounddevice library
 
 
 class TDMApplet(GlasgowAppletV2):

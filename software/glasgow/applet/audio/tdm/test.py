@@ -77,3 +77,29 @@ class TDMAppletTestCase(GlasgowAppletV2TestCase, applet=TDMApplet):
         sim.add_testbench(stream_testbench)
         with sim.write_vcd("test_spi_analyzer_frontend.vcd"):
             sim.run()
+
+    def test_sim_interface(self):
+        assembly = SimulationAssembly()
+
+        iface = TDMInterface(logger, assembly, bclk="A0", fsync="A1", rx="A2", frame_bytes=2)
+
+        ports = PortGroup()
+        ports.bclk  = assembly.get_pin("A0")
+        ports.fsync = assembly.get_pin("A1")
+        ports.rx    = assembly.get_pin("A2")
+        assembly.add_testbench(self.tdm_testbench(ports))
+
+        async def iface_testbench(ctx):
+            frames = [
+                bytes([0b01010101, 0b00000000]),
+                bytes([0b01010101, 0b00000001]),
+                bytes([0b01010101, 0b00000010]),
+                None, # invalid data
+                bytes([0b01010101, 0b00000100]),
+            ]
+            for expected in frames:
+                received = await iface.read_frame()
+                if expected is not None:
+                    self.assertEqual(received, expected)
+
+        assembly.run(iface_testbench, vcd_file="test_spi_analyzer_interface.vcd")
