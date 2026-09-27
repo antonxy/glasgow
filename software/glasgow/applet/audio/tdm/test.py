@@ -49,39 +49,36 @@ class TDMAppletTestCase(GlasgowAppletV2TestCase, applet=TDMApplet):
                     first_bit = False
         return testbench
 
-    def test_sim_frontend(self):
+    def test_sim_interface(self):
+        assembly = SimulationAssembly()
+
+        iface = TDMInterface(logger, assembly, bclk="A0", fsync="A1", rx="A2", frame_bytes=2, bclk_generator_frequency=None)
+
         ports = PortGroup()
-        ports.bclk  = io.SimulationPort("i", 1, name="bclk")
-        ports.fsync = io.SimulationPort("i", 1, name="fsync")
-        ports.rx    = io.SimulationPort("i", 1, name="rx")
+        ports.bclk  = assembly.get_pin("A0")
+        ports.fsync = assembly.get_pin("A1")
+        ports.rx    = assembly.get_pin("A2")
+        assembly.add_testbench(self.tdm_testbench(ports))
 
-        dut = TDMFrontend(ports, 2)
-
-        async def stream_testbench(ctx):
-            words = [
-                0b01010101, 0b00000000,
-                0b01010101, 0b00000001,
-                0b01010101, 0b00000010,
-                None, None, # invalid data
-                0b01010101, 0b00000100,
+        async def iface_testbench(ctx):
+            frames = [
+                bytes([0b01010101, 0b00000000]),
+                bytes([0b01010101, 0b00000001]),
+                bytes([0b01010101, 0b00000010]),
+                None, # invalid data
+                bytes([0b01010101, 0b00000100]),
             ]
-            for word in words:
-                received = await stream_get(ctx, dut.rx_stream)
-                if word is not None:
-                    self.assertEqual(word, received)
-                print("{:08b}".format(received))
+            for expected in frames:
+                received = await iface.read_frame()
+                if expected is not None:
+                    self.assertEqual(received, expected)
 
-        sim = Simulator(dut)
-        sim.add_clock(1e-6)
-        sim.add_testbench(self.tdm_testbench(ports))
-        sim.add_testbench(stream_testbench)
-        with sim.write_vcd("test_spi_analyzer_frontend.vcd"):
-            sim.run()
+        assembly.run(iface_testbench, vcd_file="test_spi_analyzer_interface.vcd")
 
     def test_sim_interface(self):
         assembly = SimulationAssembly()
 
-        iface = TDMInterface(logger, assembly, bclk="A0", fsync="A1", rx="A2", frame_bytes=2)
+        iface = TDMInterface(logger, assembly, bclk="A0", fsync="A1", rx="A2", frame_bytes=2, bclk_generator_frequency=48000*16)
 
         ports = PortGroup()
         ports.bclk  = assembly.get_pin("A0")
