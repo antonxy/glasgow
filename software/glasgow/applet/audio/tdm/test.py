@@ -7,7 +7,7 @@ from glasgow.simulation.assembly import SimulationAssembly
 from glasgow.gateware.ports import PortGroup
 from glasgow.gateware.stream import stream_get
 from glasgow.applet import GlasgowAppletV2TestCase, synthesis_test
-from . import TDMFrontend, TDMInterface, TDMApplet
+from . import TDMInterface, TDMApplet
 
 
 logger = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ class TDMAppletTestCase(GlasgowAppletV2TestCase, applet=TDMApplet):
         async def testbench(ctx):
             frames = [
                 [0,1,0,1,0,1,0,1,0,0,0,0,0,0,0,0],
-                [0,1,0,1,0,1,0,1,0,0,0,0,0,0,0,1],
+                [1,1,0,1,0,1,0,1,0,0,0,0,0,0,0,1],
                 [0,1,0,1,0,1,0,1,0,0,0,0,0,0,1,0],
                 [0,1,0,1,0,], #incomplete frame
                 [0,1,0,1,0,1,0,1,0,0,0,0,0,0,1,1], #this frame will be skipped
@@ -32,71 +32,56 @@ class TDMAppletTestCase(GlasgowAppletV2TestCase, applet=TDMApplet):
 
             # Cycle bclk a few times before first fsync
             for _ in range(10):
-                ctx.set(ports.bclk.i, 0)
-                await ctx.delay(half_cycle)
                 ctx.set(ports.bclk.i, 1)
+                await ctx.delay(half_cycle)
+                ctx.set(ports.bclk.i, 0)
                 await ctx.delay(half_cycle)
 
             for frame in frames:
                 first_bit = True
                 for rx in frame:
-                    await ctx.delay(half_cycle)
                     ctx.set(ports.fsync.i, 1 if first_bit else 0)
-                    ctx.set(ports.bclk.i, 0)
+                    ctx.set(ports.bclk.i, 1)
                     ctx.set(ports.rx.i, rx)
                     await ctx.delay(half_cycle)
-                    ctx.set(ports.bclk.i, 1)
+                    ctx.set(ports.bclk.i, 0)
+                    await ctx.delay(half_cycle)
                     first_bit = False
+
+            # Cycle bclk a few times at the end
+            for _ in range(10):
+                ctx.set(ports.bclk.i, 1)
+                await ctx.delay(half_cycle)
+                ctx.set(ports.bclk.i, 0)
+                await ctx.delay(half_cycle)
         return testbench
 
     def test_sim_interface(self):
         assembly = SimulationAssembly()
 
-        iface = TDMInterface(logger, assembly, bclk="A0", fsync="A1", rx="A2", frame_bytes=2, bclk_generator_frequency=None)
+        iface = TDMInterface(logger, assembly, bclk="A0", fsync="A1", rx="A2", tx="A3", frame_bytes=2, bclk_generator_frequency=None)
 
         ports = PortGroup()
         ports.bclk  = assembly.get_pin("A0")
         ports.fsync = assembly.get_pin("A1")
         ports.rx    = assembly.get_pin("A2")
+        ports.tx    = assembly.get_pin("A3")
         assembly.add_testbench(self.tdm_testbench(ports))
 
         async def iface_testbench(ctx):
             frames = [
                 bytes([0b01010101, 0b00000000]),
-                bytes([0b01010101, 0b00000001]),
+                bytes([0b11010101, 0b00000001]),
                 bytes([0b01010101, 0b00000010]),
                 None, # invalid data
                 bytes([0b01010101, 0b00000100]),
             ]
+            await iface.write_frame(b"\xf1\xf0")
             for expected in frames:
+                await iface.write_frame(b"\xaa\xbb")
                 received = await iface.read_frame()
+                print(received, expected)
                 if expected is not None:
                     self.assertEqual(received, expected)
 
-        assembly.run(iface_testbench, vcd_file="test_spi_analyzer_interface.vcd")
-
-    def test_sim_interface(self):
-        assembly = SimulationAssembly()
-
-        iface = TDMInterface(logger, assembly, bclk="A0", fsync="A1", rx="A2", frame_bytes=2, bclk_generator_frequency=48000*16)
-
-        ports = PortGroup()
-        ports.bclk  = assembly.get_pin("A0")
-        ports.fsync = assembly.get_pin("A1")
-        ports.rx    = assembly.get_pin("A2")
-        assembly.add_testbench(self.tdm_testbench(ports))
-
-        async def iface_testbench(ctx):
-            frames = [
-                bytes([0b01010101, 0b00000000]),
-                bytes([0b01010101, 0b00000001]),
-                bytes([0b01010101, 0b00000010]),
-                None, # invalid data
-                bytes([0b01010101, 0b00000100]),
-            ]
-            for expected in frames:
-                received = await iface.read_frame()
-                if expected is not None:
-                    self.assertEqual(received, expected)
-
-        assembly.run(iface_testbench, vcd_file="test_spi_analyzer_interface.vcd")
+        assembly.run(iface_testbench, vcd_file="test_tdm_analyzer_interface.vcd")
